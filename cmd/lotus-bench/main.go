@@ -35,13 +35,17 @@ type BenchResults struct {
 }
 
 type SealingResult struct {
-	AddPiece   time.Duration
-	PreCommit1 time.Duration
-	PreCommit2 time.Duration
-	Commit1    time.Duration
-	Commit2    time.Duration
-	Verify     time.Duration
-	Unseal     time.Duration
+	AddPiece             time.Duration
+	PreCommit1           time.Duration
+	PreCommit2           time.Duration
+	Commit1              time.Duration
+	Commit2              time.Duration
+	Verify               time.Duration
+	SealTotal            time.Duration
+	UnsealSegmentAverage time.Duration
+	UnsealSegmentMinimum time.Duration
+	UnsealSegmentMaximum time.Duration
+	Unseal               time.Duration
 }
 
 type Commit2In struct {

@@ -45,6 +45,10 @@ func (bo *BenchResults) SumSealingTime() error {
 		bo.SealingSum.Commit1 += sealing.Commit1
 		bo.SealingSum.Commit2 += sealing.Commit2
 		bo.SealingSum.Verify += sealing.Verify
+		bo.SealingSum.SealTotal += sealing.SealTotal
+		bo.SealingSum.UnsealSegmentMaximum += sealing.UnsealSegmentMaximum
+		bo.SealingSum.UnsealSegmentMinimum += sealing.UnsealSegmentMinimum
+		bo.SealingSum.UnsealSegmentAverage += sealing.UnsealSegmentAverage
 		bo.SealingSum.Unseal += sealing.Unseal
 	}
 	return nil
@@ -89,7 +93,7 @@ var sealBenchCmd = &cli.Command{
 			Name:  "skip-unseal",
 			Usage: "skip the unseal portion of the benchmark",
 		},
-		&cli.IntFlag{
+		&cli.Uint64Flag{
 			Name:  "unseal-segments",
 			Usage: "unseal the sector in this number of equal length segments",
 			Value: 1,
@@ -208,7 +212,7 @@ var sealBenchCmd = &cli.Command{
 				PreCommit2: 1,
 				Commit:     1,
 			}
-			sealTimings, extendedSealedSectors, err = runSeals(sb, sbfs, sectorNumber, parCfg, mid, sectorSize, []byte(c.String("ticket-preimage")), c.String("save-commit2-input"), skipc2, c.Bool("skip-unseal"), c.Int("unseal-segments"))
+			sealTimings, extendedSealedSectors, err = runSeals(sb, sbfs, sectorNumber, parCfg, mid, sectorSize, []byte(c.String("ticket-preimage")), c.String("save-commit2-input"), skipc2, c.Bool("skip-unseal"), c.Uint64("unseal-segments"))
 			if err != nil {
 				return xerrors.Errorf("failed to run seals: %w", err)
 			}
@@ -445,8 +449,16 @@ var sealBenchCmd = &cli.Command{
 				fmt.Printf("seal: commit phase 1: %s (%s)\n", bo.SealingSum.Commit1, bps(bo.SectorSize, bo.SectorNumber, bo.SealingSum.Commit1))
 				fmt.Printf("seal: commit phase 2: %s (%s)\n", bo.SealingSum.Commit2, bps(bo.SectorSize, bo.SectorNumber, bo.SealingSum.Commit2))
 				fmt.Printf("seal: verify: %s\n", bo.SealingSum.Verify)
+				fmt.Printf("seal: total: %s\n", bo.SealingSum.SealTotal)
 				if !c.Bool("skip-unseal") {
-					fmt.Printf("unseal: %s  (%s)\n", bo.SealingSum.Unseal, bps(bo.SectorSize, bo.SectorNumber, bo.SealingSum.Unseal))
+					if c.Int("unseal-segments") > 1 {
+						fmt.Printf("unseal: segment max %s  (%s)\n", bo.SealingSum.UnsealSegmentMaximum, bps(bo.SectorSize, bo.SectorNumber, bo.SealingSum.UnsealSegmentMaximum))
+						fmt.Printf("unseal: segment min %s  (%s)\n", bo.SealingSum.UnsealSegmentMinimum, bps(bo.SectorSize, bo.SectorNumber, bo.SealingSum.UnsealSegmentMinimum))
+						fmt.Printf("unseal: segment avg %s  (%s)\n", bo.SealingSum.UnsealSegmentAverage, bps(bo.SectorSize, bo.SectorNumber, bo.SealingSum.UnsealSegmentAverage))
+						fmt.Printf("unseal: total: %s  (%s)\n", bo.SealingSum.Unseal, bps(bo.SectorSize, bo.SectorNumber, bo.SealingSum.Unseal))
+					} else {
+						fmt.Printf("unseal: %s  (%s)\n", bo.SealingSum.Unseal, bps(bo.SectorSize, bo.SectorNumber, bo.SealingSum.Unseal))
+					}
 				}
 				fmt.Println("")
 			}
@@ -473,7 +485,7 @@ type ParCfg struct {
 	Commit     int
 }
 
-func runSeals(sb *ffiwrapper.Sealer, sbfs *basicfs.Provider, numSectors int, par ParCfg, mid abi.ActorID, sectorSize abi.SectorSize, ticketPreimage []byte, saveC2inp string, skipc2, skipunseal bool, unsealSegments int) ([]SealingResult, []prooftypes.ExtendedSectorInfo, error) {
+func runSeals(sb *ffiwrapper.Sealer, sbfs *basicfs.Provider, numSectors int, par ParCfg, mid abi.ActorID, sectorSize abi.SectorSize, ticketPreimage []byte, saveC2inp string, skipc2, skipunseal bool, unsealSegments uint64) ([]SealingResult, []prooftypes.ExtendedSectorInfo, error) {
 	var pieces []abi.PieceInfo
 	sealTimings := make([]SealingResult, numSectors)
 	sealedSectors := make([]prooftypes.ExtendedSectorInfo, numSectors)
@@ -625,6 +637,10 @@ func runSeals(sb *ffiwrapper.Sealer, sbfs *basicfs.Provider, numSectors int, par
 
 					verifySeal := time.Now()
 
+					var unseal time.Time
+					var segments bool
+					var unsealTimes []time.Duration
+
 					if !skipunseal {
 						log.Infof("[%d] Unsealing sector", i)
 						{
@@ -639,21 +655,56 @@ func runSeals(sb *ffiwrapper.Sealer, sbfs *basicfs.Provider, numSectors int, par
 							}
 						}
 
-						if unsealSegments <= 1 {
+						if unsealSegments > 1 {
+							segments = true
+						}
+						if !segments {
 							err := sb.UnsealPiece(context.TODO(), sid, 0, abi.PaddedPieceSize(sectorSize).Unpadded(), ticket, cids.Unsealed)
 							if err != nil {
 								return err
 							}
+						} else {
+							unsealTimes = make([]time.Duration, unsealSegments)
+							segmentSize := abi.PaddedPieceSize(sectorSize).Unpadded() / abi.UnpaddedPieceSize(unsealSegments)
+
+							segmentStartTime := verifySeal
+							for j := uint64(0); j < unsealSegments; j++ {
+								start := storiface.UnpaddedByteIndex(uint64(segmentSize) * j)
+								err := sb.UnsealPiece(context.TODO(), sid, start, segmentSize, ticket, cids.Unsealed)
+								if err != nil {
+									return err
+								}
+
+								unsealTimes[j] = time.Since(segmentStartTime)
+								segmentStartTime = time.Now()
+							}
 						}
+
+						unseal = time.Now()
 					}
-					unseal := time.Now()
 
 					sealTimings[i].PreCommit1 = precommit1.Sub(start)
 					sealTimings[i].PreCommit2 = precommit2.Sub(pc2Start)
 					sealTimings[i].Commit1 = sealcommit1.Sub(commitStart)
 					sealTimings[i].Commit2 = sealcommit2.Sub(sealcommit1)
 					sealTimings[i].Verify = verifySeal.Sub(sealcommit2)
+					sealTimings[i].SealTotal = verifySeal.Sub(start)
 					sealTimings[i].Unseal = unseal.Sub(verifySeal)
+
+					if segments {
+						sealTimings[i].UnsealSegmentMinimum = unsealTimes[0]
+
+						for j := uint64(0); j < unsealSegments; j++ {
+							if sealTimings[i].UnsealSegmentMinimum > unsealTimes[j] {
+								sealTimings[i].UnsealSegmentMinimum = unsealTimes[j]
+							}
+							if sealTimings[i].UnsealSegmentMaximum < unsealTimes[j] {
+								sealTimings[i].UnsealSegmentMaximum = unsealTimes[j]
+							}
+						}
+
+						sealTimings[i].UnsealSegmentAverage = sealTimings[i].Unseal / time.Duration(unsealSegments)
+					}
 				}
 				return nil
 			}()
